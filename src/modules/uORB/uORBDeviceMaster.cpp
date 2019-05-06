@@ -161,22 +161,38 @@ void uORB::DeviceMaster::printStatistics(bool reset)
 	PX4_INFO("TOPIC, NR LOST MSGS");
 	bool had_print = false;
 
+	/* Add all nodes to a list while locked, and then print them in unlocked state, to avoid potential
+	 * dead-locks (where printing blocks) */
 	lock();
+	DeviceNodeStatisticsData *first_node = nullptr;
+	DeviceNodeStatisticsData *cur_node = nullptr;
+	size_t max_topic_name_length = 0;
+	int num_topics = 0;
+	int ret = addNewDeviceNodes(&first_node, num_topics, max_topic_name_length, nullptr, 0);
+	unlock();
 
-	for (const auto &node : _node_list) {
-		if (node->print_statistics(reset)) {
-			had_print = true;
-		}
+	if (ret != 0) {
+		PX4_ERR("addNewDeviceNodes failed (%i)", ret);
 	}
 
-	unlock();
+	cur_node = first_node;
+
+	while (cur_node) {
+		if (cur_node->node->print_statistics(reset)) {
+			had_print = true;
+		}
+
+		DeviceNodeStatisticsData *prev = cur_node;
+		cur_node = cur_node->next;
+		delete prev;
+	}
 
 	if (!had_print) {
 		PX4_INFO("No lost messages");
 	}
 }
 
-void uORB::DeviceMaster::addNewDeviceNodes(DeviceNodeStatisticsData **first_node, int &num_topics,
+int uORB::DeviceMaster::addNewDeviceNodes(DeviceNodeStatisticsData **first_node, int &num_topics,
 		size_t &max_topic_name_length, char **topic_filter, int num_filters)
 {
 	DeviceNodeStatisticsData *cur_node = nullptr;
@@ -227,8 +243,7 @@ void uORB::DeviceMaster::addNewDeviceNodes(DeviceNodeStatisticsData **first_node
 		}
 
 		if (!last_node) {
-			PX4_ERR("mem alloc failed");
-			break;
+			return -ENOMEM;
 		}
 
 		last_node->node = node;
@@ -242,6 +257,8 @@ void uORB::DeviceMaster::addNewDeviceNodes(DeviceNodeStatisticsData **first_node
 		last_node->last_lost_msg_count = last_node->node->lost_message_count();
 		last_node->last_pub_msg_count = last_node->node->published_message_count();
 	}
+
+	return 0;
 }
 
 #define CLEAR_LINE "\033[K"
@@ -249,13 +266,25 @@ void uORB::DeviceMaster::addNewDeviceNodes(DeviceNodeStatisticsData **first_node
 void uORB::DeviceMaster::showTop(char **topic_filter, int num_filters)
 {
 	bool print_active_only = true;
+	bool only_once = false; // if true, run only once, then exit
 
 	if (topic_filter && num_filters > 0) {
-		if (!strcmp("-a", topic_filter[0])) {
-			num_filters = 0;
+		bool show_all = false;
+
+		for (int i = 0; i < num_filters; ++i) {
+			if (!strcmp("-a", topic_filter[i])) {
+				show_all = true;
+
+			} else if (!strcmp("-1", topic_filter[i])) {
+				only_once = true;
+			}
 		}
 
-		print_active_only = false; // print non-active if -a or some filter given
+		print_active_only = only_once ? (num_filters == 1) : false; // print non-active if -a or some filter given
+
+		if (show_all || print_active_only) {
+			num_filters = 0;
+		}
 	}
 
 	PX4_INFO_RAW("\033[2J\n"); //clear screen
@@ -272,13 +301,17 @@ void uORB::DeviceMaster::showTop(char **topic_filter, int num_filters)
 	DeviceNodeStatisticsData *cur_node = nullptr;
 	size_t max_topic_name_length = 0;
 	int num_topics = 0;
-	addNewDeviceNodes(&first_node, num_topics, max_topic_name_length, topic_filter, num_filters);
+	int ret = addNewDeviceNodes(&first_node, num_topics, max_topic_name_length, topic_filter, num_filters);
 
 	/* a DeviceNode is never deleted, so it's save to unlock here and still access the DeviceNodes */
 	unlock();
 
+	if (ret != 0) {
+		PX4_ERR("addNewDeviceNodes failed (%i)", ret);
+	}
+
 #ifdef __PX4_QURT //QuRT has no poll()
-	int num_runs = 0;
+	only_once = true;
 #else
 	const int stdin_fileno = 0;
 
@@ -292,19 +325,13 @@ void uORB::DeviceMaster::showTop(char **topic_filter, int num_filters)
 
 	while (!quit) {
 
-#ifdef __PX4_QURT
-
-		if (++num_runs > 1) {
-			quit = true; //just exit after one output
-		}
-
-#else
+#ifndef __PX4_QURT
 
 		/* Sleep 200 ms waiting for user input five times ~ 1s */
 		for (int k = 0; k < 5; k++) {
 			char c;
 
-			int ret = ::poll(&fds, 1, 0); //just want to check if there is new data available
+			ret = ::poll(&fds, 1, 0); //just want to check if there is new data available
 
 			if (ret > 0) {
 
@@ -359,8 +386,17 @@ void uORB::DeviceMaster::showTop(char **topic_filter, int num_filters)
 			}
 
 			lock();
-			addNewDeviceNodes(&first_node, num_topics, max_topic_name_length, topic_filter, num_filters);
+			ret = addNewDeviceNodes(&first_node, num_topics, max_topic_name_length, topic_filter, num_filters);
 			unlock();
+
+			if (ret != 0) {
+				PX4_ERR("addNewDeviceNodes failed (%i)", ret);
+			}
+
+		}
+
+		if (only_once) {
+			quit = true;
 		}
 	}
 
